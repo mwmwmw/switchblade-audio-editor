@@ -33,6 +33,26 @@ cargo run --release -- path/to/file.wav
 
 Optional backends: `cargo build --release --features jack` or `--features asio`.
 
+### Windows
+
+Building on Windows needs the MSVC toolchain (Visual Studio Build Tools, C++ workload);
+everything else is system-provided — WASAPI for audio, the native file dialog, the OS
+OpenGL driver. `--features asio` needs the ASIO SDK, `CPAL_ASIO_DIR` and LLVM for bindgen,
+and only builds on Windows itself.
+
+From WSL, `scripts/win-run.sh` cross-builds, copies the exe to `%USERPROFILE%\Switchblade`
+and starts it on the Windows side:
+
+```sh
+scripts/win-run.sh path/to/file.wav     # build, stage, launch
+scripts/win-run.sh --debug --wait       # console build, output relayed to this terminal
+scripts/win-run.sh -n                   # stage only
+```
+
+It needs `rustup target add x86_64-pc-windows-gnu` and `mingw-w64`; the resulting exe links
+only against system DLLs, so it also runs on a machine with no toolchain. `SWITCHBLADE_WIN_DIR`
+overrides the staging directory and `RUST_LOG` is forwarded to the app (default `warn`).
+
 ## Controls
 
 | Action | Keys |
@@ -78,3 +98,5 @@ time, so reopening skips the analysis pass. Delete the sidecar at any time; it i
   channels pass through untouched. No latency compensation when rendering.
 - MP3 and OGG export are not included (both need C encoders); use WAV, AIFF or FLAC.
 - DirectSound is not a cpal backend; on Windows, WASAPI is the default and ASIO is optional.
+- Release builds are GUI-subsystem, so log output only appears when launched from a terminal
+  (the app reattaches to the parent console) or from a debug build.

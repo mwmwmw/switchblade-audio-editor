@@ -47,10 +47,19 @@ fn has_extension(path: &Path, extension: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case(extension))
 }
 
+/// VST2 ships as a bare shared library, so its extension is the platform's own;
+/// CLAP and VST3 keep their format extension everywhere (a bundle directory on macOS).
+#[cfg(target_os = "macos")]
+const VST2_EXTENSION: &str = "vst";
+#[cfg(target_os = "windows")]
+const VST2_EXTENSION: &str = "dll";
+#[cfg(all(unix, not(target_os = "macos")))]
+const VST2_EXTENSION: &str = "so";
+
 fn extension_for(format: PluginFormat) -> &'static str {
     match format {
         PluginFormat::Clap => "clap",
-        PluginFormat::Vst2 => "vst",
+        PluginFormat::Vst2 => VST2_EXTENSION,
         PluginFormat::Vst3 => "vst3",
     }
 }
@@ -81,21 +90,30 @@ fn platform_dirs(format: PluginFormat, home: &Path) -> Vec<PathBuf> {
     ]
 }
 
+/// Only the 64-bit locations are searched: a 32-bit plugin cannot be loaded into this host,
+/// so `CommonProgramFiles(x86)` and its siblings are deliberately left out.
 #[cfg(target_os = "windows")]
 fn platform_dirs(format: PluginFormat, home: &Path) -> Vec<PathBuf> {
-    let common = PathBuf::from(r"C:\Program Files\Common Files");
+    let common = env_dir("CommonProgramFiles", r"C:\Program Files\Common Files");
+    let program_files = env_dir("ProgramFiles", r"C:\Program Files");
+    let user_common = home.join(r"AppData\Local\Programs\Common");
     match format {
-        PluginFormat::Clap => vec![
-            common.join("CLAP"),
-            home.join(r"AppData\Local\Programs\Common\CLAP"),
-        ],
+        PluginFormat::Clap => vec![common.join("CLAP"), user_common.join("CLAP")],
         PluginFormat::Vst2 => vec![
             common.join("VST2"),
-            PathBuf::from(r"C:\Program Files\VstPlugins"),
-            PathBuf::from(r"C:\Program Files\Steinberg\VstPlugins"),
+            program_files.join("VstPlugins"),
+            program_files.join(r"Steinberg\VstPlugins"),
         ],
-        PluginFormat::Vst3 => vec![common.join("VST3")],
+        PluginFormat::Vst3 => vec![common.join("VST3"), user_common.join("VST3")],
     }
+}
+
+/// Windows installs relocate, so the shell variables win over the usual `C:\Program Files`.
+#[cfg(target_os = "windows")]
+fn env_dir(key: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(fallback), PathBuf::from)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

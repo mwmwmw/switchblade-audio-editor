@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::{FromSample, Sample, SizedSample};
 use crossbeam_channel::Sender;
 
 use super::shared::{MeterChain, MeterSource, SharedState, NO_SEEK};
@@ -40,7 +41,7 @@ pub fn open(
         sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
-    let mut state = PlaybackState::new(
+    let state = PlaybackState::new(
         request,
         sample_rate,
         channels,
@@ -52,17 +53,7 @@ pub fn open(
         .lock()
         .configure(sample_rate as f64, DEFAULT_BLOCK_FRAMES)
         .unwrap_or_else(|error| log::warn!("plugin stack failed to activate: {error}"));
-    let error_events = events;
-    let stream = device
-        .build_output_stream(
-            config,
-            move |data: &mut [f32], _| state.render(data),
-            move |error| {
-                let _ = error_events.send(EngineEvent::Error(format!("output stream: {error}")));
-            },
-            None,
-        )
-        .map_err(|e| anyhow!("building output stream: {e}"))?;
+    let stream = build_stream(device, &config, default.sample_format(), state, events)?;
     stream
         .play()
         .map_err(|e| anyhow!("starting output stream: {e}"))?;
@@ -72,6 +63,50 @@ pub fn open(
         sample_rate,
         channels,
     })
+}
+
+/// The device dictates the sample type; rendering stays in f32 and converts on the way out.
+fn build_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    state: PlaybackState,
+    events: Sender<EngineEvent>,
+) -> Result<cpal::Stream> {
+    match format {
+        cpal::SampleFormat::I8 => build_typed::<i8>(device, config, state, events),
+        cpal::SampleFormat::I16 => build_typed::<i16>(device, config, state, events),
+        cpal::SampleFormat::I32 => build_typed::<i32>(device, config, state, events),
+        cpal::SampleFormat::I64 => build_typed::<i64>(device, config, state, events),
+        cpal::SampleFormat::U8 => build_typed::<u8>(device, config, state, events),
+        cpal::SampleFormat::U16 => build_typed::<u16>(device, config, state, events),
+        cpal::SampleFormat::U32 => build_typed::<u32>(device, config, state, events),
+        cpal::SampleFormat::U64 => build_typed::<u64>(device, config, state, events),
+        cpal::SampleFormat::F32 => build_typed::<f32>(device, config, state, events),
+        cpal::SampleFormat::F64 => build_typed::<f64>(device, config, state, events),
+        other => Err(anyhow!("unsupported output sample format: {other}")),
+    }
+}
+
+fn build_typed<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut state: PlaybackState,
+    events: Sender<EngineEvent>,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    device
+        .build_output_stream(
+            config.clone(),
+            move |data: &mut [T], _| state.render(data),
+            move |error| {
+                let _ = events.send(EngineEvent::Error(format!("output stream: {error}")));
+            },
+            None,
+        )
+        .map_err(|e| anyhow!("building output stream: {e}"))
 }
 
 fn choose_sample_rate(device: &cpal::Device, wanted: u32, fallback: u32) -> u32 {
@@ -140,7 +175,7 @@ impl PlaybackState {
         })
     }
 
-    fn render(&mut self, data: &mut [f32]) {
+    fn render<T: Sample + FromSample<f32>>(&mut self, data: &mut [T]) {
         let frames = data.len() / self.channels.max(1);
         self.apply_seek();
         self.prepare_scratch(frames);
@@ -229,10 +264,15 @@ impl PlaybackState {
     }
 }
 
-fn interleave(planes: &[Vec<f32>], data: &mut [f32], channels: usize, frames: usize) {
+fn interleave<T: Sample + FromSample<f32>>(
+    planes: &[Vec<f32>],
+    data: &mut [T],
+    channels: usize,
+    frames: usize,
+) {
     for frame in 0..frames {
         for channel in 0..channels {
-            data[frame * channels + channel] = planes[channel][frame];
+            data[frame * channels + channel] = T::from_sample(planes[channel][frame]);
         }
     }
 }

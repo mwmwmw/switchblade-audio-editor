@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::{FromSample, Sample, SizedSample};
 use crossbeam_channel::Sender;
 
 use super::shared::{MeterChain, MeterSource, SharedState};
@@ -50,23 +51,14 @@ pub fn open(
         buffer_size: cpal::BufferSize::Default,
     };
     let (chunk_tx, chunks) = crossbeam_channel::bounded(CHUNK_QUEUE_CAPACITY);
-    let mut state = InputState {
+    let state = InputState {
         channels,
         planes: vec![Vec::new(); channels],
         meters: MeterChain::new(MeterSource::Input, channels, sample_rate),
         shared: Arc::clone(&shared),
         chunk_tx,
     };
-    let stream = device
-        .build_input_stream(
-            config,
-            move |data: &[f32], _| state.capture(data),
-            move |error| {
-                let _ = events.send(EngineEvent::Error(format!("input stream: {error}")));
-            },
-            None,
-        )
-        .map_err(|e| anyhow!("building input stream: {e}"))?;
+    let stream = build_stream(device, &config, default.sample_format(), state, events)?;
     stream
         .play()
         .map_err(|e| anyhow!("starting input stream: {e}"))?;
@@ -82,6 +74,51 @@ pub fn open(
     })
 }
 
+/// The device dictates the sample type; captured frames are converted to f32 on arrival.
+fn build_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    state: InputState,
+    events: Sender<EngineEvent>,
+) -> Result<cpal::Stream> {
+    match format {
+        cpal::SampleFormat::I8 => build_typed::<i8>(device, config, state, events),
+        cpal::SampleFormat::I16 => build_typed::<i16>(device, config, state, events),
+        cpal::SampleFormat::I32 => build_typed::<i32>(device, config, state, events),
+        cpal::SampleFormat::I64 => build_typed::<i64>(device, config, state, events),
+        cpal::SampleFormat::U8 => build_typed::<u8>(device, config, state, events),
+        cpal::SampleFormat::U16 => build_typed::<u16>(device, config, state, events),
+        cpal::SampleFormat::U32 => build_typed::<u32>(device, config, state, events),
+        cpal::SampleFormat::U64 => build_typed::<u64>(device, config, state, events),
+        cpal::SampleFormat::F32 => build_typed::<f32>(device, config, state, events),
+        cpal::SampleFormat::F64 => build_typed::<f64>(device, config, state, events),
+        other => Err(anyhow!("unsupported input sample format: {other}")),
+    }
+}
+
+fn build_typed<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut state: InputState,
+    events: Sender<EngineEvent>,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    device
+        .build_input_stream(
+            config.clone(),
+            move |data: &[T], _| state.capture(data),
+            move |error| {
+                let _ = events.send(EngineEvent::Error(format!("input stream: {error}")));
+            },
+            None,
+        )
+        .map_err(|e| anyhow!("building input stream: {e}"))
+}
+
 struct InputState {
     channels: usize,
     planes: Vec<Vec<f32>>,
@@ -91,14 +128,18 @@ struct InputState {
 }
 
 impl InputState {
-    fn capture(&mut self, data: &[f32]) {
-        let _ = self.chunk_tx.try_send(data.to_vec());
-        self.deinterleave(data);
+    fn capture<T: Copy>(&mut self, data: &[T])
+    where
+        f32: FromSample<T>,
+    {
+        let samples: Vec<f32> = data.iter().map(|&s| f32::from_sample(s)).collect();
+        self.deinterleave(&samples);
         let planes: Vec<&[f32]> = self.planes.iter().map(Vec::as_slice).collect();
         let snapshot = self
             .meters
             .measure(&planes, self.shared.vu_reference_dbfs());
         self.shared.publish_meters(snapshot);
+        let _ = self.chunk_tx.try_send(samples);
     }
 
     fn deinterleave(&mut self, data: &[f32]) {
