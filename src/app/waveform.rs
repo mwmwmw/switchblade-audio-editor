@@ -24,6 +24,11 @@ const SAMPLE_DOT_RADIUS: f32 = 2.0;
 const MIN_HIGHLIGHT_WIDTH: f32 = 2.0;
 /// Pointer distance, in pixels, within which a selection edge can be grabbed.
 const EDGE_GRAB_PX: f32 = 6.0;
+/// Pointer travel, in pixels, before a press in empty waveform starts sweeping a new region.
+///
+/// Above egui's own click distance, so releasing after a slightly sloppy click leaves the
+/// region alone instead of replacing it with a sliver a few pixels wide.
+const NEW_REGION_TRAVEL_PX: f32 = 10.0;
 /// Pointer distance, in pixels, within which the cursor and selection edges snap to a beat.
 const BEAT_SNAP_PX: f32 = 10.0;
 const BEAT_TICK_HEIGHT: f32 = 6.0;
@@ -46,7 +51,21 @@ pub struct WaveView {
 #[derive(Clone, Copy, Debug)]
 enum DragMode {
     /// Dragging in the waveform sweeps a selection out from a fixed anchor frame.
-    Select { anchor: usize },
+    ///
+    /// A sweep that started on empty waveform is `pending` until the pointer has travelled
+    /// `NEW_REGION_TRAVEL_PX` from `origin_x`; grabbing an existing edge is never pending,
+    /// because the region it resizes is already there.
+    Select {
+        anchor: usize,
+        origin_x: f32,
+        pending: bool,
+    },
+    /// Dragging inside a selection slides the whole region along, keeping its length.
+    MoveSelection {
+        grab_frame: usize,
+        start: usize,
+        len: usize,
+    },
     /// Dragging the ruler grabs the waveform itself, which follows the pointer.
     PanContent,
     /// Dragging the scrollbar moves the thumb under the pointer, keeping the grab offset.
@@ -282,15 +301,16 @@ fn handle_input(
     // The snap radius is a fixed distance on screen, so it tightens as you zoom in and a
     // close pair of hits stays separable.
     let snap_tolerance = (BEAT_SNAP_PX as f64 * frames_per_pixel).round() as usize;
-    let frame_at = |pos: Pos2| {
-        let frame = (start_frame + (pos.x - rect.left()) as f64 * frames_per_pixel)
+    let raw_frame_at = |pos: Pos2| {
+        (start_frame + (pos.x - rect.left()) as f64 * frames_per_pixel)
             .round()
-            .max(0.0) as usize;
-        match beats {
-            Some(report) => report.nearest(frame, snap_tolerance).unwrap_or(frame),
-            None => frame,
-        }
+            .max(0.0) as usize
     };
+    let snap = |frame: usize| match beats {
+        Some(report) => report.nearest(frame, snap_tolerance).unwrap_or(frame),
+        None => frame,
+    };
+    let frame_at = |pos: Pos2| snap(raw_frame_at(pos));
     let frames = doc.clip.frames();
     let strip = layout.scroll_strip();
     let mut seek_to = None;
@@ -302,6 +322,8 @@ fn handle_input(
             }
         } else if grabbed_edge(view, doc, pos.x, rect).is_some() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+        } else if over_selection_body(view, doc, pos.x, rect) {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
         }
     }
     if response.double_clicked() {
@@ -314,16 +336,48 @@ fn handle_input(
         }
     }
     if response.drag_started() {
-        view.drag = response
-            .interact_pointer_pos()
-            .map(|pos| drag_mode_at(view, doc, layout, pos, frame_at(pos)));
+        // Where the button went down, not where the pointer is now. A press only counts as a
+        // drag after it has moved a few pixels, so by this point the pointer can already have
+        // left the edge it grabbed — reading it here would resize the wrong edge.
+        let origin = ui
+            .input(|i| i.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        view.drag = origin.map(|pos| drag_mode_at(view, doc, layout, pos, raw_frame_at(pos), snap));
     }
     if let (Some(mode), true) = (view.drag, response.dragged()) {
         match mode {
-            DragMode::Select { anchor } => {
+            DragMode::Select {
+                anchor,
+                origin_x,
+                pending,
+            } => {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let current = frame_at(pos);
-                    doc.set_selection(anchor.min(current)..anchor.max(current));
+                    let pending = pending && (pos.x - origin_x).abs() < NEW_REGION_TRAVEL_PX;
+                    if !pending {
+                        let current = frame_at(pos);
+                        doc.set_selection(anchor.min(current)..anchor.max(current));
+                    }
+                    view.drag = Some(DragMode::Select {
+                        anchor,
+                        origin_x,
+                        pending,
+                    });
+                }
+            }
+            DragMode::MoveSelection {
+                grab_frame,
+                start,
+                len,
+            } => {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                if let Some(pos) = response.interact_pointer_pos() {
+                    // The region keeps its length, so it stops against either end of the clip
+                    // rather than being trimmed by the clamp in `set_selection`.
+                    let max_start = frames.saturating_sub(len);
+                    let travelled = raw_frame_at(pos) as i64 - grab_frame as i64;
+                    let moved = (start as i64 + travelled).clamp(0, max_start as i64) as usize;
+                    let moved = snap(moved).min(max_start);
+                    doc.set_selection(moved..moved + len);
                 }
             }
             // The waveform follows the pointer, so the view moves the other way.
@@ -356,6 +410,7 @@ fn drag_mode_at(
     layout: &Layout,
     pos: Pos2,
     frame: usize,
+    snap: impl Fn(usize) -> usize,
 ) -> DragMode {
     if layout.scroll_rect.contains(pos) {
         let grab_offset = match thumb_rect(view, doc.clip.frames(), &layout.scroll_rect) {
@@ -369,9 +424,41 @@ fn drag_mode_at(
     if layout.ruler_rect.contains(pos) {
         return DragMode::PanContent;
     }
-    // Grabbing an existing edge keeps the opposite edge as the anchor, so the edge follows the pointer.
-    let anchor = grabbed_edge(view, doc, pos.x, &layout.wave_rect).unwrap_or(frame);
-    DragMode::Select { anchor }
+    // Grabbing an existing edge keeps the opposite edge as the anchor, so the edge follows the
+    // pointer and the one behind it stays put.
+    if let Some(anchor) = grabbed_edge(view, doc, pos.x, &layout.wave_rect) {
+        return DragMode::Select {
+            anchor,
+            origin_x: pos.x,
+            pending: false,
+        };
+    }
+    if let Some(selection) = doc
+        .selection
+        .as_ref()
+        .filter(|_| over_selection_body(view, doc, pos.x, &layout.wave_rect))
+    {
+        return DragMode::MoveSelection {
+            grab_frame: frame,
+            start: selection.start,
+            len: selection.len(),
+        };
+    }
+    DragMode::Select {
+        anchor: snap(frame),
+        origin_x: pos.x,
+        pending: true,
+    }
+}
+
+/// True when `x` is inside the selection and clear of both edges.
+fn over_selection_body(view: &WaveView, doc: &Document, x: f32, rect: &Rect) -> bool {
+    let Some(selection) = doc.selection.as_ref() else {
+        return false;
+    };
+    let left = view.frame_to_x(selection.start as f64, rect);
+    let right = view.frame_to_x(selection.end as f64, rect);
+    x > left + EDGE_GRAB_PX && x < right - EDGE_GRAB_PX
 }
 
 /// If `x` is on a selection edge, returns the *opposite* edge to use as the drag anchor.

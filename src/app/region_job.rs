@@ -27,7 +27,10 @@ pub struct RegionAnalysis {
 }
 
 impl RegionAnalysis {
-    /// Starts a job for the selection once the pointer is released, so drags do not queue work.
+    /// Starts a job for the current selection, so the readouts track a drag as it happens.
+    ///
+    /// Only one job runs at a time: a drag that moves the edges every frame queues nothing, it
+    /// just measures again from wherever the selection has got to once the last job lands.
     pub fn ensure(&mut self, doc: &Document, ctx: &egui::Context) {
         let Some(range) = doc.selection.clone() else {
             return;
@@ -37,8 +40,7 @@ impl RegionAnalysis {
             range,
         };
         let already_known = self.current.as_ref().is_some_and(|(k, _)| *k == key);
-        let already_running = self.pending.as_ref().is_some_and(|(k, _)| *k == key);
-        if already_known || already_running || ctx.input(|i| i.pointer.any_down()) {
+        if already_known || self.pending.is_some() {
             return;
         }
         self.pending = Some((
@@ -61,13 +63,16 @@ impl RegionAnalysis {
         self.pending.is_some()
     }
 
-    /// The report for the document's current selection, if it has been computed.
+    /// The report for the document's current selection.
+    ///
+    /// While a job is in flight the last report for this version stands in, so a drag updates
+    /// the readouts continuously instead of blanking them between measurements.
     pub fn for_selection(&self, doc: &Document) -> Option<&RegionReport> {
         let selection = doc.selection.as_ref()?;
-        self.current
-            .as_ref()
-            .filter(|(key, _)| key.version == doc.version && key.range == *selection)
-            .map(|(_, report)| report)
+        let (key, report) = self.current.as_ref()?;
+        let usable =
+            key.version == doc.version && (key.range == *selection || self.pending.is_some());
+        usable.then_some(report)
     }
 }
 

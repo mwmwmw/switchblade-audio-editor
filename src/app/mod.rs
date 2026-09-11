@@ -141,8 +141,10 @@ impl SwitchbladeApp {
         self.poll_load();
         self.analysis.ensure(&self.doc, &self.anomaly_settings, ctx);
         self.analysis.poll();
-        self.region.ensure(&self.doc, ctx);
+        // Polled first so a finished measurement is taken up before the next one is started:
+        // during a drag that turns into one job per result rather than one per frame.
         self.region.poll();
+        self.region.ensure(&self.doc, ctx);
         self.devices.poll();
         self.plugins.poll();
         self.plugins.tick_editors(&self.engine.shared);
