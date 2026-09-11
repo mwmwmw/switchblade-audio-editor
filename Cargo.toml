@@ -1,0 +1,45 @@
+[package]
+name = "switchblade"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight audio editor"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = "0.36"
+cpal = "0.18"
+symphonia = { version = "0.6", features = ["all"] }
+hound = "3.5"
+rubato = "5.0"
+ebur128 = "0.1"
+rustfft = "6.4"
+flacenc = { version = "0.5", default-features = false }
+rfd = "0.17"
+crossbeam-channel = "0.5"
+libloading = "0.9"
+anyhow = "1.0"
+thiserror = "2.0"
+dirs = "7.0"
+parking_lot = "0.12"
+clap-sys = "0.5"
+vst = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+default = []
+asio = ["cpal/asio"]
+jack = ["cpal/jack"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
