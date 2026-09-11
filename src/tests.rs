@@ -6,7 +6,7 @@ use crate::analysis::loudness::measure;
 use crate::analysis::spectrum::{average_band_spectrum, REFERENCE_BAND_INDEX};
 use crate::analysis::tonal::{equal_loudness_contour, TonalBalance};
 use crate::audio::decode::load;
-use crate::audio::encode::{save, BitDepth, ExportFormat};
+use crate::audio::encode::{save, BitDepth, ExportFormat, SaveOptions};
 use crate::audio::fade::{apply_fade, FadeCurve, FadeDirection};
 use crate::audio::normalize::normalize_peak;
 use crate::audio::resample::{resample, ResampleQuality};
@@ -14,6 +14,10 @@ use crate::audio::AudioClip;
 
 const TEST_RATE: u32 = 44_100;
 const TONE_HZ: f32 = 1000.0;
+/// Export dithers, so a roundtrip differs by up to 1.5 LSB: the TPDF noise is under 1 LSB
+/// and rounding adds another half. The tolerances allow 2 LSB to leave a little margin.
+const INT16_TOLERANCE: f32 = 2.0 / 32_768.0;
+const INT24_TOLERANCE: f32 = 2.0 / 8_388_608.0;
 
 fn sine_clip(rate: u32, seconds: f32, amplitude: f32) -> AudioClip {
     let frames = (rate as f32 * seconds) as usize;
@@ -48,7 +52,7 @@ fn roundtrip(format: ExportFormat, depth: BitDepth, tolerance: f32) {
         depth.bits(),
         format.extension()
     ));
-    save(&path, &clip, format, depth).unwrap();
+    save(&path, &clip, format, depth, &SaveOptions::default()).unwrap();
     let loaded = load(&path).unwrap();
     assert_eq!(loaded.sample_rate, TEST_RATE);
     assert_eq!(loaded.channel_count(), 2);
@@ -61,22 +65,22 @@ fn roundtrip(format: ExportFormat, depth: BitDepth, tolerance: f32) {
 
 #[test]
 fn wav_roundtrips() {
-    roundtrip(ExportFormat::Wav, BitDepth::Int16, 1.0 / 32_000.0);
-    roundtrip(ExportFormat::Wav, BitDepth::Int24, 1.0 / 8_000_000.0);
+    roundtrip(ExportFormat::Wav, BitDepth::Int16, INT16_TOLERANCE);
+    roundtrip(ExportFormat::Wav, BitDepth::Int24, INT24_TOLERANCE);
     roundtrip(ExportFormat::Wav, BitDepth::Float32, 1e-7);
 }
 
 #[test]
 fn aiff_roundtrips() {
-    roundtrip(ExportFormat::Aiff, BitDepth::Int16, 1.0 / 32_000.0);
-    roundtrip(ExportFormat::Aiff, BitDepth::Int24, 1.0 / 8_000_000.0);
+    roundtrip(ExportFormat::Aiff, BitDepth::Int16, INT16_TOLERANCE);
+    roundtrip(ExportFormat::Aiff, BitDepth::Int24, INT24_TOLERANCE);
     roundtrip(ExportFormat::Aiff, BitDepth::Float32, 1e-7);
 }
 
 #[test]
 fn flac_roundtrips() {
-    roundtrip(ExportFormat::Flac, BitDepth::Int16, 1.0 / 32_000.0);
-    roundtrip(ExportFormat::Flac, BitDepth::Int24, 1.0 / 8_000_000.0);
+    roundtrip(ExportFormat::Flac, BitDepth::Int16, INT16_TOLERANCE);
+    roundtrip(ExportFormat::Flac, BitDepth::Int24, INT24_TOLERANCE);
 }
 
 #[test]
@@ -239,7 +243,14 @@ fn iso226_contour_matches_published_values() {
 fn decodes_formats_transcoded_by_ffmpeg() {
     let source = temp_path("transcode_source.wav");
     let clip = sine_clip(TEST_RATE, 0.5, 0.5);
-    save(&source, &clip, ExportFormat::Wav, BitDepth::Int16).unwrap();
+    save(
+        &source,
+        &clip,
+        ExportFormat::Wav,
+        BitDepth::Int16,
+        &SaveOptions::default(),
+    )
+    .unwrap();
     for extension in ["mp3", "ogg", "aiff", "flac", "m4a"] {
         let target = temp_path(&format!("transcoded.{extension}"));
         let status = std::process::Command::new("ffmpeg")
@@ -314,6 +325,155 @@ fn engine_plays_through_default_output() {
 }
 
 #[test]
+fn export_dither_breaks_up_a_constant_rounding_error() {
+    // Every sample sits exactly half a 16-bit code above zero. Undithered, they all round
+    // the same way and the output is a constant; dither has to split them between the two
+    // neighbouring codes, which is the whole point of adding it.
+    let half_lsb = 0.5 / 32_768.0;
+    let clip = AudioClip {
+        sample_rate: TEST_RATE,
+        channels: vec![vec![half_lsb; 4096]],
+    };
+    let path = temp_path("dither_half_lsb.wav");
+    save(
+        &path,
+        &clip,
+        ExportFormat::Wav,
+        BitDepth::Int16,
+        &SaveOptions::default(),
+    )
+    .unwrap();
+    let loaded = load(&path).unwrap();
+    let codes: Vec<i32> = loaded.channels[0]
+        .iter()
+        .map(|s| (s * 32_768.0).round() as i32)
+        .collect();
+    assert!(
+        codes.contains(&0) && codes.contains(&1),
+        "dither should straddle both codes, saw {:?}..{:?}",
+        codes.iter().min(),
+        codes.iter().max()
+    );
+    // It must stay centred: a biased dither would shift the signal's level.
+    let mean = codes.iter().map(|c| *c as f64).sum::<f64>() / codes.len() as f64;
+    assert!((mean - 0.5).abs() < 0.05, "dither is biased: mean code {mean}");
+}
+
+/// Short decaying noise bursts at a fixed interval: a click track with clear attacks.
+fn click_track(rate: u32, bpm: f64, beats: usize) -> AudioClip {
+    let interval = (60.0 / bpm * rate as f64) as usize;
+    let mut samples = vec![0.0_f32; interval * beats];
+    let burst = rate as usize / 100; // 10 ms
+    let mut noise: u32 = 0x1234_5678;
+    for beat in 0..beats {
+        let start = beat * interval;
+        for offset in 0..burst {
+            noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let white = (noise >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0;
+            let decay = 1.0 - offset as f32 / burst as f32;
+            samples[start + offset] = white * decay * decay * 0.8;
+        }
+    }
+    AudioClip {
+        sample_rate: rate,
+        channels: vec![samples.clone(), samples],
+    }
+}
+
+#[test]
+fn beat_detection_finds_the_tempo_and_every_hit() {
+    use crate::analysis::beats::{detect, BeatSettings};
+    let bpm = 120.0;
+    let beats = 16;
+    let clip = click_track(TEST_RATE, bpm, beats);
+    let report = detect(&clip, &BeatSettings::default());
+
+    let detected = report.bpm.expect("a click track must yield a tempo");
+    assert!(
+        (detected as f64 - bpm).abs() < 2.0,
+        "expected about {bpm} BPM, got {detected}"
+    );
+    assert_eq!(
+        report.beats.len(),
+        beats,
+        "every click should be picked exactly once"
+    );
+
+    // Hits are timed from the analysis window that first saw them, so they land within a
+    // hop or so of the attack. 10 ms is the useful bound for snapping the cursor to one.
+    let interval = (60.0 / bpm * TEST_RATE as f64) as usize;
+    let tolerance = TEST_RATE as usize / 100;
+    for (index, beat) in report.beats.iter().enumerate() {
+        let expected = index * interval;
+        assert!(
+            beat.frame.abs_diff(expected) <= tolerance,
+            "hit {index} at frame {} should be within {tolerance} of {expected}",
+            beat.frame
+        );
+    }
+}
+
+#[test]
+fn beat_detection_separates_a_real_attack_from_the_noise_floor() {
+    use crate::analysis::beats::{detect, BeatSettings};
+    // A sine that starts abruptly from silence has exactly one attack — its own onset. The
+    // envelope is normalised against its own 95th percentile, so the steady tone that follows
+    // still throws up weak peaks; the onset has to stand clearly above all of them.
+    let report = detect(&sine_clip(TEST_RATE, 2.0, 0.5), &BeatSettings::default());
+    let first = report.beats.first().expect("the onset should be found");
+    assert!(
+        first.frame <= TEST_RATE as usize / 100,
+        "the onset belongs at the start, not frame {}",
+        first.frame
+    );
+    let loudest_after = report.beats[1..]
+        .iter()
+        .map(|beat| beat.strength)
+        .fold(0.0_f32, f32::max);
+    assert!(
+        first.strength > loudest_after * 2.0,
+        "onset ({:.2}) should tower over the noise floor ({loudest_after:.2})",
+        first.strength
+    );
+}
+
+#[test]
+fn beat_detection_reports_every_click_at_full_strength() {
+    use crate::analysis::beats::{detect, BeatSettings};
+    // Identical clicks should read as identical hits: nothing in the chain may favour the
+    // start or end of the file, which is what a mis-timed analysis window would show up as.
+    let report = detect(&click_track(TEST_RATE, 140.0, 12), &BeatSettings::default());
+    assert_eq!(report.beats.len(), 12);
+    let strengths: Vec<f32> = report.beats.iter().map(|beat| beat.strength).collect();
+    let weakest = strengths.iter().copied().fold(f32::MAX, f32::min);
+    let strongest = strengths.iter().copied().fold(0.0_f32, f32::max);
+    assert!(
+        weakest > strongest * 0.9,
+        "identical clicks should score alike, got {weakest:.2}..{strongest:.2}"
+    );
+}
+
+#[test]
+fn loop_bounds_published_for_the_audio_thread() {
+    use crate::engine::SharedState;
+    let shared = SharedState::default();
+    assert_eq!(shared.loop_range(), None);
+    shared.set_loop(Some(100..200));
+    assert_eq!(shared.loop_range(), Some(100..200));
+    // Resizing the loop replaces it outright, so the audio thread sees the new bounds.
+    shared.set_loop(Some(100..150));
+    assert_eq!(shared.loop_range(), Some(100..150));
+    // Empty and inverted ranges clear the loop rather than trapping playback in zero frames.
+    shared.set_loop(Some(150..150));
+    assert_eq!(shared.loop_range(), None);
+    shared.set_loop(Some(200..100));
+    assert_eq!(shared.loop_range(), None);
+    shared.set_loop(Some(1..2));
+    shared.set_loop(None);
+    assert_eq!(shared.loop_range(), None);
+}
+
+#[test]
 fn new_documents_never_reuse_a_version() {
     use crate::document::Document;
     let first = Document::default();
@@ -333,7 +493,14 @@ fn analysis_cache_roundtrips_through_sidecar() {
     let path = temp_path("cached_source.wav");
     let mut clip = sine_clip(TEST_RATE, 0.5, 0.9);
     clip.channels[0][1000..1010].fill(1.0);
-    save(&path, &clip, ExportFormat::Wav, BitDepth::Float32).unwrap();
+    save(
+        &path,
+        &clip,
+        ExportFormat::Wav,
+        BitDepth::Float32,
+        &SaveOptions::default(),
+    )
+    .unwrap();
     let report = analyze(&clip, &AnomalySettings::default());
     let sidecar = cache::store(&path, &report).unwrap();
     assert!(sidecar.exists());
@@ -355,6 +522,7 @@ fn analysis_cache_roundtrips_through_sidecar() {
         &sine_clip(TEST_RATE, 0.6, 0.9),
         ExportFormat::Wav,
         BitDepth::Float32,
+        &SaveOptions::default(),
     )
     .unwrap();
     assert!(

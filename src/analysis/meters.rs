@@ -70,8 +70,14 @@ impl VuMeter {
     }
 }
 
+/// Accumulated in f64 so a long block's total keeps its precision before it becomes a dB
+/// readout; squares of small samples are exactly where an f32 sum loses the quiet ones.
 fn mean_power(planes: &[&[f32]]) -> f32 {
-    let total: f32 = planes.iter().flat_map(|p| p.iter()).map(|s| s * s).sum();
+    let total: f64 = planes
+        .iter()
+        .flat_map(|p| p.iter())
+        .map(|s| (*s as f64) * (*s as f64))
+        .sum();
     let count: usize = planes.iter().map(|p| p.len()).sum();
-    total / count.max(1) as f32
+    (total / count.max(1) as f64) as f32
 }

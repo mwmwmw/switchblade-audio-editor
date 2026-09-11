@@ -6,12 +6,20 @@ at a time, and puts clipping, dropouts and bad edits front and centre.
 ## Features (v1)
 
 - **Open** WAV, AIFF/AIFC, FLAC, MP3, OGG Vorbis, AAC/M4A, CAF, MKV/WebM audio (via symphonia).
-- **Save** WAV, AIFF/AIFC and FLAC at 16-bit, 24-bit or 32-bit float (FLAC: 16/24).
+- **Save** WAV, AIFF/AIFC and FLAC at 16-bit, 24-bit or 32-bit float (FLAC: 16/24), with
+  TPDF dither on every fixed-point export.
 - **Edit**: cut, copy, paste, delete, trim, silence, with snapshot undo/redo.
 - **Resample** to any rate with a 256-tap windowed-sinc resampler (or a fast FFT mode).
 - **Normalize** peak to 0, −0.03, −3, −6, −12, −18 dBFS or a custom level.
 - **Fades** in/out over the selection or a duration: linear, equal-power, exponential,
   logarithmic, S-curve.
+- **Repair** the discontinuities the scan flags, blending a short window across each jump,
+  and **remove DC offset** per channel.
+- **Seamless loops**: crossfade the run-up to the loop over its tail with a Hann pair, and
+  write the loop points into the saved file (WAV `smpl`, AIFF `MARK`/`INST`).
+- **Beat detection**: spectral-flux onsets and an autocorrelation tempo estimate, ported from
+  the m8-groove extractor. Detected hits draw on the ruler and the cursor and selection edges
+  snap to them (View → Snap to beats); the tempo shows in the status bar.
 - **Plugin stack**: CLAP and VST2 plugins run live during playback and can be rendered
   into the file. VST3 bundles are discovered and listed but not yet hosted.
 - **Tonal balance** per third-octave band, three ways: perceived loudness after the
@@ -61,7 +69,8 @@ overrides the staging directory and `RUST_LOG` is forwarded to the app (default 
 | Record, loop selection | R, L |
 | Select by dragging, select all | drag, ⌘A / double-click |
 | Zoom around cursor or selection | wheel or pinch |
-| Pan | horizontal scroll, ⇧ + wheel |
+| Pan | horizontal scroll, ⇧ + wheel, or drag the ruler |
+| Scroll when zoomed in | drag the bar above the ruler |
 | Zoom to fit / to selection | ⌘0, ⌘E |
 | Cut / copy / paste / delete | ⌘X ⌘C ⌘V, Delete |
 | Trim, normalize | ⌘T, ⌘N |
@@ -93,7 +102,11 @@ time, so reopening skips the analysis pass. Delete the sidecar at any time; it i
 
 - VST3 hosting is not implemented; the bundles appear in the browser so they can be
   wired up later without changing the UI.
-- Plugin GUIs are not shown; parameters are exposed as generic sliders.
+- Plugin editors only open for CLAP plugins offering a *floating* window, which they create
+  and own. Embedded editors — the common case, and every VST2 editor — need a native parent
+  window Switchblade does not create yet, so those plugins still show generic sliders.
+- Beat detection is aimed at percussive material. On sustained material the onset envelope has
+  little to latch onto and the weaker hits it reports are the normalised noise floor.
 - The plugin stack runs stereo. Mono files are duplicated into both channels; extra
   channels pass through untouched. No latency compensation when rendering.
 - MP3 and OGG export are not included (both need C encoders); use WAV, AIFF or FLAC.

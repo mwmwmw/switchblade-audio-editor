@@ -3,6 +3,9 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::thread::ThreadId;
 
 use anyhow::{anyhow, bail, Result};
 use clap_sys::audio_buffer::clap_audio_buffer;
@@ -14,6 +17,14 @@ use clap_sys::events::{
 use clap_sys::ext::audio_ports::{
     clap_audio_port_info, clap_plugin_audio_ports, CLAP_EXT_AUDIO_PORTS,
 };
+use clap_sys::ext::gui::{clap_host_gui, clap_plugin_gui, CLAP_EXT_GUI};
+#[cfg(target_os = "macos")]
+use clap_sys::ext::gui::CLAP_WINDOW_API_COCOA;
+#[cfg(target_os = "windows")]
+use clap_sys::ext::gui::CLAP_WINDOW_API_WIN32;
+#[cfg(all(unix, not(target_os = "macos")))]
+use clap_sys::ext::gui::CLAP_WINDOW_API_X11;
+use clap_sys::ext::thread_check::{clap_host_thread_check, CLAP_EXT_THREAD_CHECK};
 use clap_sys::ext::params::{
     clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_STEPPED,
@@ -28,6 +39,14 @@ use libloading::Library;
 use super::scan::binary_path;
 use super::stack::STACK_CHANNELS;
 use super::{ParamInfo, PluginDescriptor, PluginFormat, PluginInstance};
+
+/// Window API this platform speaks, as CLAP names them.
+#[cfg(target_os = "windows")]
+const WINDOW_API: &CStr = CLAP_WINDOW_API_WIN32;
+#[cfg(target_os = "macos")]
+const WINDOW_API: &CStr = CLAP_WINDOW_API_COCOA;
+#[cfg(all(unix, not(target_os = "macos")))]
+const WINDOW_API: &CStr = CLAP_WINDOW_API_X11;
 
 const ENTRY_SYMBOL: &[u8] = b"clap_entry\0";
 const HOST_NAME: &CStr = c"Switchblade";
@@ -138,7 +157,11 @@ pub struct ClapInstance {
     descriptor: PluginDescriptor,
     plugin: *const clap_plugin,
     host: Box<clap_host>,
+    /// Kept alive for as long as the plugin can call back into it; `host.host_data` points here.
+    host_data: Box<HostData>,
     library: Option<ClapLibrary>,
+    gui_ext: *const clap_plugin_gui,
+    editor_open: bool,
     params_ext: *const clap_plugin_params,
     params: Vec<ParamInfo>,
     cookies: Vec<*mut c_void>,
@@ -156,7 +179,10 @@ unsafe impl Send for ClapInstance {}
 impl ClapInstance {
     unsafe fn create(descriptor: &PluginDescriptor) -> Result<Self> {
         let library = ClapLibrary::open(&descriptor.path)?;
-        let host = new_host();
+        let mut host_data = Box::new(HostData::default());
+        let mut host = new_host();
+        // Callbacks arrive with only the host pointer, so they find their way back here.
+        host.host_data = (&mut *host_data as *mut HostData).cast();
         let id = CString::new(descriptor.id.as_bytes())?;
         let create = (*library.factory)
             .create_plugin
@@ -173,7 +199,10 @@ impl ClapInstance {
             descriptor: descriptor.clone(),
             plugin,
             host,
+            host_data,
             library: Some(library),
+            gui_ext: extension(plugin, CLAP_EXT_GUI) as *const clap_plugin_gui,
+            editor_open: false,
             params_ext: extension(plugin, CLAP_EXT_PARAMS) as *const clap_plugin_params,
             params: Vec::new(),
             cookies: Vec::new(),
@@ -312,6 +341,69 @@ impl PluginInstance for ClapInstance {
         &self.descriptor
     }
 
+    fn has_editor(&self) -> bool {
+        unsafe { self.supports_floating_gui() }
+    }
+
+    fn editor_is_open(&self) -> bool {
+        self.editor_open
+    }
+
+    fn open_editor(&mut self) -> Result<()> {
+        if self.editor_open {
+            return Ok(());
+        }
+        unsafe {
+            if !self.supports_floating_gui() {
+                bail!(
+                    "{} only offers an embedded editor, which needs host windowing \
+                     Switchblade does not have yet",
+                    self.descriptor.name
+                );
+            }
+            let gui = &*self.gui_ext;
+            let create = gui.create.ok_or_else(|| anyhow!("gui.create missing"))?;
+            if !create(self.plugin, WINDOW_API.as_ptr(), true) {
+                bail!("{} refused to create its editor", self.descriptor.name);
+            }
+            if let Some(suggest_title) = gui.suggest_title {
+                let title = CString::new(format!("{} — Switchblade", self.descriptor.name))
+                    .unwrap_or_default();
+                suggest_title(self.plugin, title.as_ptr());
+            }
+            if let Some(show) = gui.show {
+                if !show(self.plugin) {
+                    if let Some(destroy) = gui.destroy {
+                        destroy(self.plugin);
+                    }
+                    bail!("{} would not show its editor", self.descriptor.name);
+                }
+            }
+        }
+        self.host_data.editor_closed.store(false, Ordering::Relaxed);
+        self.editor_open = true;
+        Ok(())
+    }
+
+    fn close_editor(&mut self) {
+        if !self.editor_open {
+            return;
+        }
+        unsafe {
+            if let Some(destroy) = self.gui_ext.as_ref().and_then(|gui| gui.destroy) {
+                destroy(self.plugin);
+            }
+        }
+        self.editor_open = false;
+    }
+
+    /// Notices a window the plugin closed on its own, so the panel's button goes back in step.
+    fn tick_editor(&mut self) {
+        if self.editor_open && self.host_data.editor_closed.swap(false, Ordering::Relaxed) {
+            self.close_editor();
+        }
+    }
+
     fn params(&self) -> &[ParamInfo] {
         &self.params
     }
@@ -418,8 +510,25 @@ impl PluginInstance for ClapInstance {
     }
 }
 
+impl ClapInstance {
+    /// True when the plugin can put its editor in a window it owns.
+    ///
+    /// Embedded editors are the common case and are deliberately not reported here: they
+    /// need a native parent window, so claiming support would only produce a dead button.
+    unsafe fn supports_floating_gui(&self) -> bool {
+        let Some(gui) = self.gui_ext.as_ref() else {
+            return false;
+        };
+        let (Some(supported), Some(_)) = (gui.is_api_supported, gui.create) else {
+            return false;
+        };
+        supported(self.plugin, WINDOW_API.as_ptr(), true)
+    }
+}
+
 impl Drop for ClapInstance {
     fn drop(&mut self) {
+        self.close_editor();
         self.deactivate();
         unsafe {
             if let Some(destroy) = (*self.plugin).destroy {
@@ -427,7 +536,9 @@ impl Drop for ClapInstance {
             }
         }
         self.library.take();
+        // Both outlive every call the plugin could still make through them.
         let _ = &self.host;
+        let _ = &self.host_data;
     }
 }
 
@@ -522,6 +633,40 @@ unsafe extern "C" fn events_try_push(
     true
 }
 
+/// Per-instance state the plugin's callbacks reach through `clap_host::host_data`.
+#[derive(Default)]
+struct HostData {
+    /// Set when the plugin tells us its editor went away, e.g. the user closed the window.
+    editor_closed: AtomicBool,
+}
+
+/// Wrapper that lets a `static` hold the C vtables, which are fn pointers and so are Sync.
+struct SyncVtable<T>(T);
+unsafe impl<T> Sync for SyncVtable<T> {}
+
+static HOST_GUI: SyncVtable<clap_host_gui> = SyncVtable(clap_host_gui {
+    resize_hints_changed: Some(host_noop),
+    // A floating window sizes itself, so the host has nothing to resize or reveal.
+    request_resize: Some(host_request_resize),
+    request_show: Some(host_request_show_or_hide),
+    request_hide: Some(host_request_show_or_hide),
+    closed: Some(host_gui_closed),
+});
+
+static HOST_THREAD_CHECK: SyncVtable<clap_host_thread_check> = SyncVtable(clap_host_thread_check {
+    is_main_thread: Some(host_is_main_thread),
+    is_audio_thread: Some(host_is_audio_thread),
+});
+
+/// The thread that built the UI. Plugins ask before touching anything thread-restricted, and
+/// several refuse to create an editor at all when the host cannot answer.
+static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
+
+/// Records the calling thread as the main one. Called once while the app starts up.
+pub fn set_main_thread() {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+}
+
 fn new_host() -> Box<clap_host> {
     Box::new(clap_host {
         clap_version: CLAP_VERSION,
@@ -537,11 +682,53 @@ fn new_host() -> Box<clap_host> {
     })
 }
 
+unsafe fn host_data(host: *const clap_host) -> Option<&'static HostData> {
+    if host.is_null() {
+        return None;
+    }
+    ((*host).host_data as *const HostData).as_ref()
+}
+
 unsafe extern "C" fn host_get_extension(
     _host: *const clap_host,
-    _id: *const c_char,
+    id: *const c_char,
 ) -> *const c_void {
+    if id.is_null() {
+        return ptr::null();
+    }
+    let id = CStr::from_ptr(id);
+    if id == CLAP_EXT_GUI {
+        return (&HOST_GUI.0 as *const clap_host_gui).cast();
+    }
+    if id == CLAP_EXT_THREAD_CHECK {
+        return (&HOST_THREAD_CHECK.0 as *const clap_host_thread_check).cast();
+    }
     ptr::null()
 }
 
 unsafe extern "C" fn host_noop(_host: *const clap_host) {}
+
+unsafe extern "C" fn host_request_resize(_host: *const clap_host, _w: u32, _h: u32) -> bool {
+    false
+}
+
+unsafe extern "C" fn host_request_show_or_hide(_host: *const clap_host) -> bool {
+    false
+}
+
+unsafe extern "C" fn host_gui_closed(host: *const clap_host, _was_destroyed: bool) {
+    if let Some(data) = host_data(host) {
+        data.editor_closed.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn host_is_main_thread(_host: *const clap_host) -> bool {
+    MAIN_THREAD
+        .get()
+        .is_some_and(|id| *id == std::thread::current().id())
+}
+
+unsafe extern "C" fn host_is_audio_thread(_host: *const clap_host) -> bool {
+    // Everything that is not the UI thread reaches plugins from the audio callback.
+    !host_is_main_thread(_host)
+}

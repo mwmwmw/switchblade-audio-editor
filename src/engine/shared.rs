@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -8,6 +9,8 @@ use crate::audio::db::SILENCE_DB;
 use crate::plugins::stack::ProcessingStack;
 
 pub const NO_SEEK: usize = usize::MAX;
+/// Sentinel stored in `loop_start` when nothing is looping.
+const NO_LOOP: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MeterSource {
@@ -51,6 +54,9 @@ pub struct SharedState {
     pub seek_request: AtomicUsize,
     pub playing: AtomicBool,
     pub recording: AtomicBool,
+    /// Loop bounds in document frames, re-read every block so the loop can be edited mid-playback.
+    loop_start: AtomicUsize,
+    loop_end: AtomicUsize,
     vu_reference_bits: AtomicU32,
     pub meters: Mutex<MeterSnapshot>,
     pub stack: Mutex<ProcessingStack>,
@@ -63,6 +69,8 @@ impl Default for SharedState {
             seek_request: AtomicUsize::new(NO_SEEK),
             playing: AtomicBool::new(false),
             recording: AtomicBool::new(false),
+            loop_start: AtomicUsize::new(NO_LOOP),
+            loop_end: AtomicUsize::new(NO_LOOP),
             vu_reference_bits: AtomicU32::new(DEFAULT_VU_REFERENCE_DBFS.to_bits()),
             meters: Mutex::new(MeterSnapshot::default()),
             stack: Mutex::new(ProcessingStack::default()),
@@ -86,6 +94,26 @@ impl SharedState {
 
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the loop the audio thread should honour; `None` clears it.
+    ///
+    /// The end is stored first so a block that reads between the two stores sees the old
+    /// loop or no loop, never a start past its end.
+    pub fn set_loop(&self, range: Option<Range<usize>>) {
+        match range.filter(|range| range.end > range.start) {
+            Some(range) => {
+                self.loop_end.store(range.end, Ordering::Relaxed);
+                self.loop_start.store(range.start, Ordering::Relaxed);
+            }
+            None => self.loop_start.store(NO_LOOP, Ordering::Relaxed),
+        }
+    }
+
+    pub fn loop_range(&self) -> Option<Range<usize>> {
+        let start = self.loop_start.load(Ordering::Relaxed);
+        let end = self.loop_end.load(Ordering::Relaxed);
+        (start != NO_LOOP && end > start).then_some(start..end)
     }
 
     pub fn request_seek(&self, frame: usize) {

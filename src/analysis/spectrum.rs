@@ -43,10 +43,15 @@ pub fn average_band_spectrum(clip: &AudioClip) -> BandSpectrum {
     BandSpectrum { levels_db }
 }
 
+/// Per-bin mean power over the whole clip.
+///
+/// The running totals are f64: a few minutes of audio is tens of thousands of blocks, and an
+/// f32 total drifts by a noticeable fraction of a dB long before the end of a long file. The
+/// FFT itself stays f32 — the error that matters here is in the summation, not the transform.
 fn average_power_spectrum(clip: &AudioClip) -> Vec<f32> {
     let fft = FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
     let window = hann_window();
-    let mut accumulated = vec![0.0_f32; FFT_SIZE / 2];
+    let mut accumulated = vec![0.0_f64; FFT_SIZE / 2];
     let mut buffer = vec![Complex::new(0.0, 0.0); FFT_SIZE];
     let mut block_count = 0_usize;
     for channel in &clip.channels {
@@ -54,13 +59,13 @@ fn average_power_spectrum(clip: &AudioClip) -> Vec<f32> {
             fill_windowed(&mut buffer, block, &window);
             fft.process(&mut buffer);
             for (sum, bin) in accumulated.iter_mut().zip(&buffer) {
-                *sum += bin.norm_sqr();
+                *sum += bin.norm_sqr() as f64;
             }
             block_count += 1;
         }
     }
-    let scale = 1.0 / (block_count.max(1) as f32 * FFT_SIZE as f32);
-    accumulated.iter().map(|p| p * scale).collect()
+    let scale = 1.0 / (block_count.max(1) as f64 * FFT_SIZE as f64);
+    accumulated.iter().map(|p| (p * scale) as f32).collect()
 }
 
 fn hann_window() -> Vec<f32> {

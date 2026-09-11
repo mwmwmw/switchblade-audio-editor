@@ -57,6 +57,29 @@ pub trait PluginInstance: Send {
     fn deactivate(&mut self);
     /// Processes `frames` samples from `input` into `output`; both hold `stack::STACK_CHANNELS` planes.
     fn process(&mut self, input: &[Vec<f32>], output: &mut [Vec<f32>], frames: usize);
+
+    /// Whether this plugin can show its own editor window.
+    ///
+    /// Only plugins that provide a *floating* editor qualify today: those create and own
+    /// their window themselves. An embedded editor has to be parented into a window the host
+    /// supplies, which means native windowing code Switchblade does not have yet.
+    fn has_editor(&self) -> bool {
+        false
+    }
+
+    fn editor_is_open(&self) -> bool {
+        false
+    }
+
+    /// Opens the editor. Must be called from the main thread; CLAP requires it.
+    fn open_editor(&mut self) -> Result<()> {
+        anyhow::bail!("{} has no editor Switchblade can show", self.descriptor().name)
+    }
+
+    fn close_editor(&mut self) {}
+
+    /// Called once per UI frame while an editor is open, for hosts duties that need a pulse.
+    fn tick_editor(&mut self) {}
 }
 
 pub fn load(descriptor: &PluginDescriptor) -> Result<Box<dyn PluginInstance>> {

@@ -10,8 +10,13 @@ pub const WAVEFORM_DOT: Color32 = Color32::from_rgb(200, 230, 255);
 pub const RULER_BACKGROUND: Color32 = Color32::from_rgb(24, 26, 30);
 pub const RULER_TEXT: Color32 = Color32::from_rgb(150, 155, 165);
 pub const RULER_TICK: Color32 = Color32::from_rgb(90, 95, 105);
+pub const SCROLL_TRACK: Color32 = Color32::from_rgb(24, 26, 30);
+pub const SCROLL_THUMB: Color32 = Color32::from_rgb(80, 86, 98);
 pub const SELECTION: Color32 = Color32::from_rgba_premultiplied(60, 90, 140, 70);
 pub const SELECTION_EDGE: Color32 = Color32::from_rgb(140, 170, 220);
+/// Violet, kept clear of the orange discontinuity highlights so a beat never reads as a fault.
+pub const BEAT_MARKER: Color32 = Color32::from_rgb(180, 130, 235);
+pub const BEAT_LINE: Color32 = Color32::from_rgba_premultiplied(52, 36, 70, 80);
 pub const CURSOR: Color32 = Color32::from_rgb(230, 230, 230);
 pub const PLAYHEAD: Color32 = Color32::from_rgb(90, 220, 120);
 pub const CLIP: Color32 = Color32::from_rgb(235, 60, 60);

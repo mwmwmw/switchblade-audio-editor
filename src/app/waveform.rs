@@ -4,13 +4,17 @@ use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke
 
 use super::{format, theme};
 use crate::analysis::anomalies::{Anomaly, AnomalyKind};
+use crate::analysis::beats::BeatReport;
 use crate::analysis::peaks::{scan_min_max, PeakMipmap};
 use crate::analysis::report::AnalysisReport;
 use crate::document::Document;
 
 const MIN_FRAMES_PER_PIXEL: f64 = 0.02;
+const SCROLLBAR_HEIGHT: f32 = 6.0;
 const RULER_HEIGHT: f32 = 20.0;
 const MARKER_STRIP_HEIGHT: f32 = 5.0;
+/// A thumb narrower than this is hard to grab, so it stops shrinking with the zoom.
+const MIN_THUMB_WIDTH: f32 = 24.0;
 const LANE_GAP: f32 = 2.0;
 const AMPLITUDE_HEADROOM: f32 = 0.94;
 /// Samples inspected per column while the peak mipmap is still being built.
@@ -20,6 +24,9 @@ const SAMPLE_DOT_RADIUS: f32 = 2.0;
 const MIN_HIGHLIGHT_WIDTH: f32 = 2.0;
 /// Pointer distance, in pixels, within which a selection edge can be grabbed.
 const EDGE_GRAB_PX: f32 = 6.0;
+/// Pointer distance, in pixels, within which the cursor and selection edges snap to a beat.
+const BEAT_SNAP_PX: f32 = 10.0;
+const BEAT_TICK_HEIGHT: f32 = 6.0;
 const MAX_DRAWN_ANOMALIES: usize = 4000;
 const WHEEL_ZOOM_SENSITIVITY: f64 = 0.004;
 const MIN_TICK_SPACING_PX: f32 = 90.0;
@@ -32,7 +39,18 @@ pub struct WaveView {
     start_frame: f64,
     frames_per_pixel: f64,
     fit_pending: bool,
-    drag_anchor: Option<usize>,
+    drag: Option<DragMode>,
+}
+
+/// What the pointer started on decides what a drag does for the rest of the gesture.
+#[derive(Clone, Copy, Debug)]
+enum DragMode {
+    /// Dragging in the waveform sweeps a selection out from a fixed anchor frame.
+    Select { anchor: usize },
+    /// Dragging the ruler grabs the waveform itself, which follows the pointer.
+    PanContent,
+    /// Dragging the scrollbar moves the thumb under the pointer, keeping the grab offset.
+    DragThumb { grab_offset: f32 },
 }
 
 pub struct WaveResponse {
@@ -45,7 +63,7 @@ impl Default for WaveView {
             start_frame: 0.0,
             frames_per_pixel: 1.0,
             fit_pending: true,
-            drag_anchor: None,
+            drag: None,
         }
     }
 }
@@ -117,6 +135,7 @@ pub fn show(
     doc: &mut Document,
     analysis: Option<&AnalysisReport>,
     play_position: Option<usize>,
+    snap_to_beats: bool,
 ) -> WaveResponse {
     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
     let rect = response.rect;
@@ -126,17 +145,24 @@ pub fn show(
         view.fit(frames, rect.width());
     }
     let lanes = Layout::new(&rect, doc.clip.channel_count());
+    // Snapping only makes sense once the analysis pass has produced hits to snap to.
+    let beats = snap_to_beats
+        .then(|| analysis.map(|a| &a.beats))
+        .flatten()
+        .filter(|report| !report.beats.is_empty());
     let seek_to = handle_input(
         ui,
         view,
         doc,
         &response,
-        &lanes.wave_rect,
+        &lanes,
         play_position.is_some(),
+        beats,
     );
     view.clamp(frames, rect.width());
 
     painter.rect_filled(rect, 0.0, theme::BACKGROUND);
+    paint_scrollbar(&painter, view, &lanes, frames);
     paint_ruler(&painter, view, &lanes, doc.clip.sample_rate);
     for (channel, lane) in lanes.lanes.iter().enumerate() {
         paint_lane(
@@ -151,6 +177,9 @@ pub fn show(
     if let Some(analysis) = analysis {
         paint_anomalies(&painter, view, &lanes, &analysis.anomalies.anomalies);
     }
+    if let Some(beats) = beats {
+        paint_beats(&painter, view, &lanes, beats);
+    }
     paint_selection(&painter, view, doc, &lanes.wave_rect);
     paint_marker(&painter, view, doc.cursor, &lanes.wave_rect, theme::CURSOR);
     if let Some(position) = play_position {
@@ -160,6 +189,7 @@ pub fn show(
 }
 
 struct Layout {
+    scroll_rect: Rect,
     ruler_rect: Rect,
     marker_rect: Rect,
     wave_rect: Rect,
@@ -168,7 +198,11 @@ struct Layout {
 
 impl Layout {
     fn new(rect: &Rect, channels: usize) -> Self {
-        let ruler_rect = Rect::from_min_size(rect.min, vec2(rect.width(), RULER_HEIGHT));
+        let scroll_rect = Rect::from_min_size(rect.min, vec2(rect.width(), SCROLLBAR_HEIGHT));
+        let ruler_rect = Rect::from_min_size(
+            pos2(rect.left(), scroll_rect.bottom()),
+            vec2(rect.width(), RULER_HEIGHT),
+        );
         let marker_rect = Rect::from_min_size(
             pos2(rect.left(), ruler_rect.bottom()),
             vec2(rect.width(), MARKER_STRIP_HEIGHT),
@@ -186,34 +220,87 @@ impl Layout {
             })
             .collect();
         Self {
+            scroll_rect,
             ruler_rect,
             marker_rect,
             wave_rect,
             lanes,
         }
     }
+
+    /// The strip above the waveform: dragging anywhere in it scrolls rather than selects.
+    fn scroll_strip(&self) -> Rect {
+        self.scroll_rect.union(self.ruler_rect)
+    }
 }
 
+/// Visible window as a thumb across the whole file, or `None` when the file all fits on screen.
+fn thumb_rect(view: &WaveView, frames: usize, scroll_rect: &Rect) -> Option<Rect> {
+    let frames = frames as f64;
+    let width = scroll_rect.width() as f64;
+    let visible = width * view.frames_per_pixel;
+    if frames <= 0.0 || visible >= frames {
+        return None;
+    }
+    let thumb_width = ((visible / frames * width) as f32).max(MIN_THUMB_WIDTH);
+    let span = scroll_rect.width() - thumb_width;
+    let offset = (view.start_frame / (frames - visible)).clamp(0.0, 1.0) as f32 * span;
+    Some(Rect::from_min_size(
+        pos2(scroll_rect.left() + offset, scroll_rect.top()),
+        vec2(thumb_width, scroll_rect.height()),
+    ))
+}
+
+/// Inverse of `thumb_rect`: the start frame that puts the thumb's left edge at `x`.
+fn start_frame_for_thumb_x(view: &WaveView, frames: usize, scroll_rect: &Rect, x: f32) -> f64 {
+    let frames = frames as f64;
+    let visible = scroll_rect.width() as f64 * view.frames_per_pixel;
+    let thumb_width = ((visible / frames * scroll_rect.width() as f64) as f32).max(MIN_THUMB_WIDTH);
+    let span = scroll_rect.width() - thumb_width;
+    if span <= 0.0 {
+        return 0.0;
+    }
+    let fraction = ((x - scroll_rect.left()) / span).clamp(0.0, 1.0) as f64;
+    fraction * (frames - visible).max(0.0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_input(
     ui: &Ui,
     view: &mut WaveView,
     doc: &mut Document,
     response: &egui::Response,
-    rect: &Rect,
+    layout: &Layout,
     playing: bool,
+    beats: Option<&BeatReport>,
 ) -> Option<usize> {
+    let rect = &layout.wave_rect;
     if response.hovered() {
         handle_wheel(ui, view, doc, rect);
     }
     let (start_frame, frames_per_pixel) = (view.start_frame, view.frames_per_pixel);
+    // The snap radius is a fixed distance on screen, so it tightens as you zoom in and a
+    // close pair of hits stays separable.
+    let snap_tolerance = (BEAT_SNAP_PX as f64 * frames_per_pixel).round() as usize;
     let frame_at = |pos: Pos2| {
-        (start_frame + (pos.x - rect.left()) as f64 * frames_per_pixel)
+        let frame = (start_frame + (pos.x - rect.left()) as f64 * frames_per_pixel)
             .round()
-            .max(0.0) as usize
+            .max(0.0) as usize;
+        match beats {
+            Some(report) => report.nearest(frame, snap_tolerance).unwrap_or(frame),
+            None => frame,
+        }
     };
+    let frames = doc.clip.frames();
+    let strip = layout.scroll_strip();
     let mut seek_to = None;
     if let Some(pos) = response.hover_pos() {
-        if grabbed_edge(view, doc, pos.x, rect).is_some() {
+        if strip.contains(pos) {
+            let scrollable = thumb_rect(view, frames, &layout.scroll_rect).is_some();
+            if scrollable {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+            }
+        } else if grabbed_edge(view, doc, pos.x, rect).is_some() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
         }
     }
@@ -227,39 +314,87 @@ fn handle_input(
         }
     }
     if response.drag_started() {
-        // Grabbing an existing edge keeps the opposite edge as the anchor, so the edge follows the pointer.
-        view.drag_anchor = response
+        view.drag = response
             .interact_pointer_pos()
-            .map(|pos| grabbed_edge(view, doc, pos.x, rect).unwrap_or_else(|| frame_at(pos)));
+            .map(|pos| drag_mode_at(view, doc, layout, pos, frame_at(pos)));
     }
-    if response.dragged() {
-        if let (Some(anchor), Some(pos)) = (view.drag_anchor, response.interact_pointer_pos()) {
-            let current = frame_at(pos);
-            doc.set_selection(anchor.min(current)..anchor.max(current));
+    if let (Some(mode), true) = (view.drag, response.dragged()) {
+        match mode {
+            DragMode::Select { anchor } => {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let current = frame_at(pos);
+                    doc.set_selection(anchor.min(current)..anchor.max(current));
+                }
+            }
+            // The waveform follows the pointer, so the view moves the other way.
+            DragMode::PanContent => {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                view.pan_pixels(response.drag_delta().x);
+            }
+            DragMode::DragThumb { grab_offset } => {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    view.start_frame = start_frame_for_thumb_x(
+                        view,
+                        frames,
+                        &layout.scroll_rect,
+                        pos.x - grab_offset,
+                    );
+                }
+            }
         }
     }
     if response.drag_stopped() {
-        view.drag_anchor = None;
+        view.drag = None;
     }
     seek_to
 }
 
-/// Vertical wheel and pinch zoom around the selection (or the cursor); horizontal wheel pans.
-/// Only the dominant axis of a diagonal trackpad swipe is used so the view does not jitter.
+/// Picks the gesture from where the press landed: scrollbar, ruler, or the waveform itself.
+fn drag_mode_at(
+    view: &WaveView,
+    doc: &Document,
+    layout: &Layout,
+    pos: Pos2,
+    frame: usize,
+) -> DragMode {
+    if layout.scroll_rect.contains(pos) {
+        let grab_offset = match thumb_rect(view, doc.clip.frames(), &layout.scroll_rect) {
+            // Pressing beside the thumb jumps it under the pointer, then drags from its centre.
+            Some(thumb) if !thumb.contains(pos) => thumb.width() / 2.0,
+            Some(thumb) => pos.x - thumb.left(),
+            None => return DragMode::PanContent,
+        };
+        return DragMode::DragThumb { grab_offset };
+    }
+    if layout.ruler_rect.contains(pos) {
+        return DragMode::PanContent;
+    }
+    // Grabbing an existing edge keeps the opposite edge as the anchor, so the edge follows the pointer.
+    let anchor = grabbed_edge(view, doc, pos.x, &layout.wave_rect).unwrap_or(frame);
+    DragMode::Select { anchor }
+}
+
 /// If `x` is on a selection edge, returns the *opposite* edge to use as the drag anchor.
+///
+/// The nearer edge wins. On a selection narrower than twice the grab distance both edges
+/// match, and testing the start first would quietly turn every drag of the end into a drag
+/// of the start — which is what a short loop region does at any useful zoom level.
 fn grabbed_edge(view: &WaveView, doc: &Document, x: f32, rect: &Rect) -> Option<usize> {
     let selection = doc.selection.as_ref()?;
-    let start_x = view.frame_to_x(selection.start as f64, rect);
-    let end_x = view.frame_to_x(selection.end as f64, rect);
-    if (x - start_x).abs() <= EDGE_GRAB_PX {
+    let to_start = (x - view.frame_to_x(selection.start as f64, rect)).abs();
+    let to_end = (x - view.frame_to_x(selection.end as f64, rect)).abs();
+    if to_start.min(to_end) > EDGE_GRAB_PX {
+        return None;
+    }
+    if to_start <= to_end {
         Some(selection.end)
-    } else if (x - end_x).abs() <= EDGE_GRAB_PX {
-        Some(selection.start)
     } else {
-        None
+        Some(selection.start)
     }
 }
 
+/// Vertical wheel and pinch zoom around the selection (or the cursor); horizontal wheel pans.
+/// Only the dominant axis of a diagonal trackpad swipe is used so the view does not jitter.
 fn handle_wheel(ui: &Ui, view: &mut WaveView, doc: &Document, rect: &Rect) {
     let (scroll, pinch, modifiers) =
         ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers));
@@ -313,6 +448,13 @@ fn paint_ruler(painter: &egui::Painter, view: &WaveView, layout: &Layout, sample
             theme::RULER_TEXT,
         );
         tick += step;
+    }
+}
+
+fn paint_scrollbar(painter: &egui::Painter, view: &WaveView, layout: &Layout, frames: usize) {
+    painter.rect_filled(layout.scroll_rect, 0.0, theme::SCROLL_TRACK);
+    if let Some(thumb) = thumb_rect(view, frames, &layout.scroll_rect) {
+        painter.rect_filled(thumb.shrink2(vec2(0.0, 1.0)), 2.0, theme::SCROLL_THUMB);
     }
 }
 
@@ -475,6 +617,24 @@ fn paint_anomaly(
         pos2(x1, marker_strip.bottom()),
     );
     painter.rect_filled(marker, 0.0, edge);
+}
+
+/// Ticks hanging from the ruler mark the detected hits, so it is obvious what will be snapped to.
+fn paint_beats(painter: &egui::Painter, view: &WaveView, layout: &Layout, report: &BeatReport) {
+    let visible = view.visible_range(&layout.wave_rect);
+    let stroke = Stroke::new(1.0, theme::BEAT_MARKER);
+    for beat in &report.beats {
+        if beat.frame < visible.start {
+            continue;
+        }
+        if beat.frame > visible.end {
+            break;
+        }
+        let x = view.frame_to_x(beat.frame as f64, &layout.wave_rect);
+        let bottom = layout.ruler_rect.bottom();
+        painter.vline(x, bottom - BEAT_TICK_HEIGHT..=bottom, stroke);
+        painter.vline(x, layout.wave_rect.y_range(), Stroke::new(1.0, theme::BEAT_LINE));
+    }
 }
 
 fn paint_selection(painter: &egui::Painter, view: &WaveView, doc: &Document, rect: &Rect) {

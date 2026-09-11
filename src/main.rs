@@ -38,6 +38,8 @@ fn main() -> eframe::Result {
     attach_parent_console();
     // Plugin loads, stream errors and cache misses are all logged at warn; show them by default.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Plugins ask which thread they are on before touching anything thread-restricted.
+    plugins::clap::set_main_thread();
     let initial_file = std::env::args().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

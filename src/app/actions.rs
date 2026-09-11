@@ -5,11 +5,13 @@ use anyhow::Result;
 use crossbeam_channel::Receiver;
 
 use super::dialogs::{ExportDialog, FadeDialog, FadeScope, NormalizeDialog, ResampleDialog};
-use super::SwitchbladeApp;
+use super::{format, SwitchbladeApp};
 use crate::analysis::report::AnalysisReport;
-use crate::audio::encode::{self, BitDepth, ExportFormat};
+use crate::audio::encode::{self, BitDepth, ExportFormat, SaveOptions};
 use crate::audio::fade::{apply_fade, FadeCurve, FadeDirection};
+use crate::audio::loop_fade::{crossfade_loop, DEFAULT_FADE_MS};
 use crate::audio::normalize::normalize_peak;
+use crate::audio::repair::{count_discontinuities, repair_discontinuities, DEFAULT_WINDOW_MS};
 use crate::audio::resample::{resample, ResampleQuality};
 use crate::audio::{decode, AudioClip};
 use crate::cache;
@@ -34,11 +36,15 @@ pub enum Action {
     Stop,
     ToggleRecord,
     ToggleLoop,
+    ToggleBeatSnap,
     ZoomFit,
     ZoomSelection,
     GoToStart,
     GoToEnd,
     Normalize,
+    RemoveDc,
+    RepairDiscontinuities,
+    CrossfadeLoop,
     FadeIn,
     FadeOut,
     Resample,
@@ -75,11 +81,15 @@ impl SwitchbladeApp {
             Action::Stop => self.stop(),
             Action::ToggleRecord => self.toggle_record(),
             Action::ToggleLoop => self.loop_playback = !self.loop_playback,
+            Action::ToggleBeatSnap => self.toggle_beat_snap(),
             Action::ZoomFit => self.view.zoom_to_fit(),
             Action::ZoomSelection => self.zoom_to_selection(),
             Action::GoToStart => self.doc.set_cursor(0),
             Action::GoToEnd => self.doc.set_cursor(self.doc.clip.frames()),
             Action::Normalize => self.dialogs.normalize = Some(NormalizeDialog::default()),
+            Action::RemoveDc => self.remove_dc(),
+            Action::RepairDiscontinuities => self.repair_discontinuities(),
+            Action::CrossfadeLoop => self.crossfade_loop(),
             Action::FadeIn => {
                 self.dialogs.fade =
                     Some(FadeDialog::new(FadeDirection::In, self.doc.has_selection()))
@@ -194,7 +204,11 @@ impl SwitchbladeApp {
     }
 
     fn write_file(&mut self, path: &Path, format: ExportFormat, depth: BitDepth) {
-        match encode::save(path, &self.doc.clip, format, depth) {
+        // The loop the user is hearing is the loop that gets written into the file.
+        let options = SaveOptions {
+            loop_points: self.active_loop_range(),
+        };
+        match encode::save(path, &self.doc.clip, format, depth, &options) {
             Ok(()) => {
                 self.doc.mark_saved(path.to_path_buf());
                 self.analysis.persist(self.doc.version, path.to_path_buf());
@@ -292,6 +306,67 @@ impl SwitchbladeApp {
         }
     }
 
+    fn remove_dc(&mut self) {
+        let range = self.doc.edit_range();
+        let rate = self.doc.clip.sample_rate;
+        let mut offsets = Vec::new();
+        self.apply_edit("Remove DC", |clip| {
+            offsets = crate::audio::dc::remove(clip, &range)
+        });
+        let worst = crate::audio::dc::largest(&offsets);
+        if worst == 0.0 {
+            return self.set_status("No DC offset to remove");
+        }
+        let summary: Vec<String> = offsets.iter().map(|o| format!("{:+.5}", o)).collect();
+        self.set_status(format!(
+            "Removed DC offset over {}: {}",
+            format::time(range.len(), rate),
+            summary.join(", ")
+        ));
+    }
+
+    fn repair_discontinuities(&mut self) {
+        let range = self.doc.edit_range();
+        let threshold = self.anomaly_settings.discontinuity_jump;
+        let found = count_discontinuities(&self.doc.clip, &range, threshold);
+        if found == 0 {
+            return self.set_status("No discontinuities in range");
+        }
+        let mut repaired = 0;
+        self.apply_edit("Repair discontinuities", |clip| {
+            repaired = repair_discontinuities(clip, &range, threshold, DEFAULT_WINDOW_MS)
+        });
+        self.set_status(format!(
+            "Repaired {repaired} discontinuit{} over a {DEFAULT_WINDOW_MS} ms window",
+            if repaired == 1 { "y" } else { "ies" }
+        ));
+    }
+
+    fn crossfade_loop(&mut self) {
+        let Some(range) = self.active_loop_range().or_else(|| self.doc.selection.clone()) else {
+            return self.set_error("Select the loop region first");
+        };
+        let mut result = None;
+        self.apply_edit("Crossfade loop", |clip| {
+            result = Some(crossfade_loop(clip, &range, DEFAULT_FADE_MS))
+        });
+        match result {
+            Some(Ok(fade)) => {
+                let rate = self.doc.clip.sample_rate;
+                self.set_status(format!(
+                    "Crossfaded the loop over {}",
+                    format::time(fade.frames, rate)
+                ));
+            }
+            Some(Err(error)) => {
+                // The clip was cloned and committed before the fade failed, so step back.
+                self.doc.undo();
+                self.set_error(format!("Crossfade failed: {error}"));
+            }
+            None => {}
+        }
+    }
+
     pub fn fade(&mut self, curve: FadeCurve, direction: FadeDirection, scope: FadeScope) {
         let frames = self.doc.clip.frames();
         let range = match scope {
@@ -340,6 +415,24 @@ impl SwitchbladeApp {
         }
     }
 
+    fn toggle_beat_snap(&mut self) {
+        self.snap_to_beats = !self.snap_to_beats;
+        if !self.snap_to_beats {
+            return self.set_status("Beat snapping off");
+        }
+        match self.analysis.for_version(self.doc.version) {
+            Some(report) if !report.beats.beats.is_empty() => {
+                let count = report.beats.beats.len();
+                match report.beats.bpm {
+                    Some(bpm) => self.set_status(format!("Snapping to {count} hits · {bpm:.1} BPM")),
+                    None => self.set_status(format!("Snapping to {count} hits")),
+                }
+            }
+            Some(_) => self.set_status("No hits detected to snap to"),
+            None => self.set_status("Snapping to beats once the analysis finishes"),
+        }
+    }
+
     fn zoom_to_selection(&mut self) {
         if let Some(selection) = self.doc.selection.clone() {
             self.view.zoom_to_range(&selection, self.last_wave_width);
@@ -354,11 +447,16 @@ impl SwitchbladeApp {
         }
     }
 
+    /// The selection acts as the loop region whenever looping is on.
+    pub fn active_loop_range(&self) -> Option<std::ops::Range<usize>> {
+        self.doc.selection.clone().filter(|_| self.loop_playback)
+    }
+
     fn play(&mut self) {
         if self.doc.clip.is_empty() {
             return self.set_status("Nothing to play");
         }
-        let loop_range = self.doc.selection.clone().filter(|_| self.loop_playback);
+        let loop_range = self.active_loop_range();
         let start_frame = if self.doc.cursor >= self.doc.clip.frames() {
             0
         } else {

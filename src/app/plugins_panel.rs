@@ -123,6 +123,18 @@ impl PluginPanel {
         }
     }
 
+    /// Lets plugins notice a window the user closed behind the host's back.
+    pub fn tick_editors(&mut self, shared: &SharedState) {
+        let Some(mut stack) = shared.stack.try_lock() else {
+            return;
+        };
+        for slot in stack.slots_mut() {
+            if slot.instance.editor_is_open() {
+                slot.instance.tick_editor();
+            }
+        }
+    }
+
     fn stack_ui(&mut self, ui: &mut Ui, shared: &SharedState) -> Option<PluginAction> {
         let mut stack = shared.stack.lock();
         let mut action = None;
@@ -181,6 +193,7 @@ impl PluginPanel {
                 if ui.small_button("✕").clicked() {
                     self.pending_remove = Some(index);
                 }
+                editor_button(ui, slot, &mut self.error);
                 if ui
                     .add_enabled(index + 1 < count, egui::Button::new("▼").small())
                     .clicked()
@@ -198,6 +211,33 @@ impl PluginPanel {
         if self.expanded_slot == Some(index) {
             param_editor(ui, slot);
         }
+    }
+}
+
+/// Opens or closes the plugin's own window; disabled for plugins that cannot show one.
+fn editor_button(
+    ui: &mut Ui,
+    slot: &mut crate::plugins::stack::PluginSlot,
+    error: &mut Option<String>,
+) {
+    let open = slot.instance.editor_is_open();
+    let available = open || slot.instance.has_editor();
+    let button = egui::Button::new(if open { "Hide UI" } else { "UI" }).small();
+    let response = ui.add_enabled(available, button);
+    let response = if available {
+        response.on_hover_text("Show the plugin's own editor")
+    } else {
+        response.on_disabled_hover_text(
+            "This plugin only offers an embedded editor, which Switchblade cannot host yet",
+        )
+    };
+    if !response.clicked() {
+        return;
+    }
+    if open {
+        slot.instance.close_editor();
+    } else if let Err(problem) = slot.instance.open_editor() {
+        *error = Some(problem.to_string());
     }
 }
 

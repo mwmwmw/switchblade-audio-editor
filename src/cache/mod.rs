@@ -11,6 +11,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::analysis::anomalies::{Anomaly, AnomalyKind, AnomalyReport, AnomalySettings};
+use crate::analysis::beats::{Beat, BeatReport, BeatSettings};
 use crate::analysis::loudness::LoudnessReport;
 use crate::analysis::peaks::PeakMipmap;
 use crate::analysis::report::AnalysisReport;
@@ -18,7 +19,8 @@ use crate::analysis::spectrum::{BandSpectrum, BAND_COUNT};
 use codec::{Reader, Writer};
 
 const MAGIC: &[u8; 4] = b"SBPK";
-const FORMAT_VERSION: u32 = 1;
+/// Bumped to 2 when detected beats joined the report; older sidecars are simply rebuilt.
+const FORMAT_VERSION: u32 = 2;
 pub const SIDECAR_EXTENSION: &str = "sbpk";
 const APP_CACHE_DIR: &str = "switchblade";
 const KIND_CLIP: u8 = 0;
@@ -118,6 +120,7 @@ fn encode(fingerprint: Fingerprint, report: &AnalysisReport) -> Vec<u8> {
     writer.u32(fingerprint.modified_nanos);
     encode_settings(&mut writer, &report.settings);
     encode_anomalies(&mut writer, &report.anomalies);
+    encode_beats(&mut writer, report.beat_settings, &report.beats);
     encode_loudness(&mut writer, report.loudness.as_ref());
     writer.f32_slice(&report.spectrum.levels_db);
     encode_peaks(&mut writer, &report.peaks);
@@ -140,9 +143,14 @@ fn decode(bytes: &[u8], expected: Fingerprint) -> Result<AnalysisReport> {
     if fingerprint != expected {
         bail!("audio file changed since the cache was written");
     }
+    let settings = decode_settings(&mut reader)?;
+    let anomalies = decode_anomalies(&mut reader)?;
+    let (beat_settings, beats) = decode_beats(&mut reader)?;
     let report = AnalysisReport {
-        settings: decode_settings(&mut reader)?,
-        anomalies: decode_anomalies(&mut reader)?,
+        settings,
+        anomalies,
+        beat_settings,
+        beats,
         loudness: decode_loudness(&mut reader)?,
         spectrum: decode_spectrum(&mut reader)?,
         peaks: decode_peaks(&mut reader)?,
@@ -167,6 +175,40 @@ fn decode_settings(reader: &mut Reader) -> Result<AnomalySettings> {
         zero_min_run: reader.u64()? as usize,
         discontinuity_jump: reader.f32()?,
     })
+}
+
+fn encode_beats(writer: &mut Writer, settings: BeatSettings, report: &BeatReport) {
+    writer.u8(settings.sensitivity);
+    // BPM is optional; f32::NAN stands in for "could not be estimated".
+    writer.f32(report.bpm.unwrap_or(f32::NAN));
+    writer.u64(report.beats.len() as u64);
+    for beat in &report.beats {
+        writer.u64(beat.frame as u64);
+        writer.f32(beat.strength);
+    }
+}
+
+fn decode_beats(reader: &mut Reader) -> Result<(BeatSettings, BeatReport)> {
+    let settings = BeatSettings {
+        sensitivity: reader.u8()?,
+    };
+    let bpm = reader.f32()?;
+    let count = reader.len_prefix()?;
+    let beats = (0..count)
+        .map(|_| {
+            Ok(Beat {
+                frame: reader.u64()? as usize,
+                strength: reader.f32()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        settings,
+        BeatReport {
+            beats,
+            bpm: bpm.is_finite().then_some(bpm),
+        },
+    ))
 }
 
 fn encode_anomalies(writer: &mut Writer, report: &AnomalyReport) {

@@ -127,7 +127,6 @@ struct PlaybackState {
     ratio: f64,
     position: usize,
     end: usize,
-    loop_start: Option<usize>,
     channels: usize,
     scratch: Vec<Vec<f32>>,
     meters: MeterChain,
@@ -152,22 +151,19 @@ impl PlaybackState {
         };
         let ratio = source_rate as f64 / sample_rate as f64;
         let to_playback = |frame: usize| (frame as f64 / ratio).round() as usize;
-        let (position, end, loop_start) = match &request.loop_range {
-            Some(range) => (
-                to_playback(range.start),
-                to_playback(range.end).min(clip.frames()),
-                Some(to_playback(range.start)),
-            ),
-            None => (to_playback(request.start_frame), clip.frames(), None),
+        // A loop starts at its head; from then on the bounds are read live from shared state.
+        let start = match &request.loop_range {
+            Some(range) => range.start,
+            None => request.start_frame,
         };
+        let end = clip.frames();
         Ok(Self {
             meters: MeterChain::new(MeterSource::Playback, channels, sample_rate),
             scratch: vec![Vec::new(); channels],
+            position: to_playback(start),
             clip,
             ratio,
-            position,
             end,
-            loop_start,
             channels,
             shared,
             events,
@@ -202,12 +198,28 @@ impl PlaybackState {
         }
     }
 
+    /// The loop the UI currently wants, in playback frames and clamped to the clip.
+    ///
+    /// Read once per block rather than cached at stream start, so dragging the loop edges
+    /// or toggling the loop off takes effect within a block instead of on the next play.
+    fn loop_bounds(&self) -> Option<Range<usize>> {
+        let range = self.shared.loop_range()?;
+        let to_playback = |frame: usize| (frame as f64 / self.ratio).round() as usize;
+        let start = to_playback(range.start).min(self.end);
+        let end = to_playback(range.end).min(self.end);
+        (end > start).then_some(start..end)
+    }
+
     fn fill_from_clip(&mut self, frames: usize) {
+        let looping = self.loop_bounds();
         for frame in 0..frames {
-            if self.position >= self.end {
-                match self.loop_start {
-                    Some(start) if start < self.end => self.position = start,
-                    _ => {
+            let end = looping.as_ref().map_or(self.end, |range| range.end);
+            if self.position >= end {
+                match &looping {
+                    // Covers a loop that shrank or moved behind the playhead as well as the
+                    // ordinary wrap: either way the next frame comes from the loop head.
+                    Some(range) => self.position = range.start,
+                    None => {
                         self.write_silence_frame(frame);
                         self.mark_finished();
                         continue;

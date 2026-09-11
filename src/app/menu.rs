@@ -50,6 +50,22 @@ pub fn show(app: &mut SwitchbladeApp, ui: &mut Ui) {
             item(app, ui, "Fade out…", Action::FadeOut, has_audio);
             item(app, ui, "Resample…", Action::Resample, has_audio);
             ui.separator();
+            item(app, ui, "Remove DC offset", Action::RemoveDc, has_audio);
+            item(
+                app,
+                ui,
+                "Repair discontinuities",
+                Action::RepairDiscontinuities,
+                has_audio,
+            );
+            item(
+                app,
+                ui,
+                "Crossfade loop",
+                Action::CrossfadeLoop,
+                app.doc.has_selection(),
+            );
+            ui.separator();
             let stack_ready = app.engine.shared.stack.lock().has_active_plugins();
             item(
                 app,
@@ -68,6 +84,13 @@ pub fn show(app: &mut SwitchbladeApp, ui: &mut Ui) {
                 Action::ZoomSelection,
                 app.doc.has_selection(),
             );
+            ui.separator();
+            let snap_label = if app.snap_to_beats {
+                "✓ Snap to beats"
+            } else {
+                "Snap to beats"
+            };
+            item(app, ui, snap_label, Action::ToggleBeatSnap, true);
             ui.separator();
             item(
                 app,

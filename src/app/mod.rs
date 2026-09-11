@@ -92,6 +92,7 @@ pub struct SwitchbladeApp {
     pub(super) status: String,
     pub(super) status_is_error: bool,
     pub(super) loop_playback: bool,
+    pub(super) snap_to_beats: bool,
     pub(super) show_side_panel: bool,
     pub(super) export_format: ExportFormat,
     pub(super) export_depth: BitDepth,
@@ -121,6 +122,7 @@ impl SwitchbladeApp {
             status: "Open a file, drop one here, or press R to record".into(),
             status_is_error: false,
             loop_playback: false,
+            snap_to_beats: false,
             show_side_panel: true,
             export_format: ExportFormat::Wav,
             export_depth: BitDepth::Int24,
@@ -143,6 +145,7 @@ impl SwitchbladeApp {
         self.region.poll();
         self.devices.poll();
         self.plugins.poll();
+        self.plugins.tick_editors(&self.engine.shared);
         self.tonal.poll();
         for event in self.engine.poll_events() {
             self.handle_engine_event(event);
@@ -220,7 +223,14 @@ impl SwitchbladeApp {
         let play_position =
             playing.then(|| self.engine.shared.play_position.load(Ordering::Relaxed));
         let analysis = self.analysis.for_version(self.doc.version);
-        let response = waveform::show(ui, &mut self.view, &mut self.doc, analysis, play_position);
+        let response = waveform::show(
+            ui,
+            &mut self.view,
+            &mut self.doc,
+            analysis,
+            play_position,
+            self.snap_to_beats,
+        );
         if let Some(frame) = response.seek_to {
             self.engine.send(crate::engine::EngineCommand::Seek(frame));
         }
@@ -248,13 +258,21 @@ impl SwitchbladeApp {
 
     fn file_summary(&self) -> String {
         let clip = &self.doc.clip;
-        format!(
+        let mut summary = format!(
             "{} · {} · {} · {}",
             self.doc.title(),
             format::sample_rate(clip.sample_rate),
             format::channels(clip.channel_count()),
             format::time(clip.frames(), clip.sample_rate)
-        )
+        );
+        if let Some(bpm) = self.detected_bpm() {
+            summary.push_str(&format!(" · {bpm:.1} BPM"));
+        }
+        summary
+    }
+
+    fn detected_bpm(&self) -> Option<f32> {
+        self.analysis.for_version(self.doc.version)?.beats.bpm
     }
 
     fn anomaly_summary(&self, ui: &mut Ui) {
@@ -339,6 +357,9 @@ impl eframe::App for SwitchbladeApp {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.waveform_area(ui));
         self.dialogs_ui(&ctx);
+        // Published after every frame's input so edits to the loop region reach the audio
+        // thread immediately, rather than only at the next Play.
+        self.engine.shared.set_loop(self.active_loop_range());
         if self.needs_animation() {
             ctx.request_repaint_after(REPAINT_INTERVAL);
         }
